@@ -18,6 +18,7 @@ import (
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	Db             *database.Queries
+	platform       string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -41,7 +42,16 @@ func (cfg *apiConfig) requestsCount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) resetCount(w http.ResponseWriter, r *http.Request) {
+	if cfg.platform != "dev" {
+		w.WriteHeader(403)
+		return
+	}
+
 	cfg.fileserverHits.Store(0)
+
+	//Delete all records
+	cfg.Db.DeleteUsers(r.Context())
+
 	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(200)
 	msg := []byte("Sucessfully reset")
@@ -120,12 +130,70 @@ func parseRequest(w http.ResponseWriter, r *http.Request) {
 	w.Write(resp)
 }
 
+func (cfg apiConfig) newUser(w http.ResponseWriter, r *http.Request) {
+
+	type client_data struct {
+		Email string `json:"email"`
+	}
+
+	var data client_data
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&data)
+	if err != nil {
+		log.Printf("Failed to decode: %s", err)
+		msg := "Something went wrong"
+		responseError(w, msg, 500)
+		return
+	}
+
+	if len(data.Email) == 0 {
+		msg := "Please provide an email"
+		responseError(w, msg, 400)
+		return
+	}
+
+	user, err := cfg.Db.CreateUser(r.Context(), data.Email)
+	if err != nil {
+		log.Printf("Failed to create user: %s", err)
+		msg := "Email already exists"
+		responseError(w, msg, 409)
+		return
+	}
+
+	type user_resp struct {
+		Id         string `json:"id"`
+		Created_at string `json:"created_at"`
+		Updated_at string `json:"updated_at"`
+		Email      string `json:"email"`
+	}
+
+	var json_user user_resp
+	json_user.Id = user.ID.String()
+	json_user.Created_at = user.CreatedAt.String()
+	json_user.Updated_at = user.UpdatedAt.String()
+	json_user.Email = user.Email
+
+	json_data, err := json.Marshal(json_user)
+	if err != nil {
+		log.Printf("Failed to Marshal json data: %s", err)
+		msg := "Failed to Marshal data"
+		responseError(w, msg, 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	w.Write(json_data)
+
+}
+
 func main() {
 
 	//Database connection
 	godotenv.Load()
 
 	dbURL := os.Getenv("DB_URL")
+	pf := os.Getenv("PLATFORM")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal("Failed to connect to database")
@@ -135,7 +203,8 @@ func main() {
 
 	mux := http.NewServeMux()
 	api_cfg := apiConfig{
-		Db: dbQueries,
+		Db:       dbQueries,
+		platform: pf,
 	}
 
 	//Server index.html
@@ -154,6 +223,7 @@ func main() {
 	mux.HandleFunc("POST /api/validate_chirp", func(w http.ResponseWriter, r *http.Request) {
 		parseRequest(w, r)
 	})
+	mux.HandleFunc("POST /api/users", api_cfg.newUser)
 	server := http.Server{}
 	server.Handler = mux
 	server.Addr = ":8080"
