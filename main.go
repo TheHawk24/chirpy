@@ -9,8 +9,11 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
+	"github.com/TheHawk24/chirpy/internal/auth"
 	"github.com/TheHawk24/chirpy/internal/database"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
@@ -58,25 +61,36 @@ func (cfg *apiConfig) resetCount(w http.ResponseWriter, r *http.Request) {
 	w.Write(msg)
 }
 
+func responseMsg(w http.ResponseWriter, status_code int, data interface{}) {
+
+	msg, err := json.Marshal(data)
+	if err != nil {
+		log.Printf("Failed to marshal data: %s", err)
+		msg := "Something went wrong"
+		responseError(w, msg, 500)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status_code)
+	w.Write(msg)
+}
+
 func responseError(w http.ResponseWriter, msg_err string, resp_code int) {
 	type errorResponse struct {
 		Response string `json:"error"`
 	}
 	var e errorResponse
 	e.Response = msg_err
-	resp, err := json.Marshal(e)
-	if err != nil {
-		log.Printf("Error encoding error response: %s", err)
-		return
-	}
-	w.WriteHeader(resp_code)
-	w.Write(resp)
+	responseMsg(w, resp_code, e)
+	//w.WriteHeader(resp_code)
+	//w.Write(resp)
 }
 
-func parseRequest(w http.ResponseWriter, r *http.Request) {
+func (cfg apiConfig) newChirp(w http.ResponseWriter, r *http.Request) {
 
 	type params struct {
-		Body string `json:"body"`
+		Body   string `json:"body"`
+		UserID string `json:"user_id"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
@@ -111,29 +125,119 @@ func parseRequest(w http.ResponseWriter, r *http.Request) {
 
 	cleaned := strings.Join(words, " ")
 
-	type msgOK struct {
-		Cleaned_body string `json:"cleaned_body"`
-	}
-
-	var ok msgOK
-	ok.Cleaned_body = cleaned
-	resp, err := json.Marshal(ok)
+	var chirp_params database.CreateChirpParams
+	chirp_params.Body = cleaned
+	user_id, err := uuid.Parse(data.UserID)
 	if err != nil {
-		log.Printf("Faild to marshal respsonse: %s", err)
-		msg := "Somethign went wrong"
+		log.Printf("Error parsing uuid: %s", err)
+		msg := "Something went wrong"
+		responseError(w, msg, 500)
+		return
+	}
+	chirp_params.UserID = user_id
+
+	chirp, err := cfg.Db.CreateChirp(r.Context(), chirp_params)
+	if err != nil {
+		log.Printf("Failed to create chirp: %s", err)
+		msg := "Something went wrong"
 		responseError(w, msg, 500)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(200)
-	w.Write(resp)
+	type msgOK struct {
+		ID        string    `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Body      string    `json:"body"`
+		UserID    string    `json:"user_id"`
+	}
+
+	var ok msgOK
+	ok.ID = chirp.ID.String()
+	ok.CreatedAt = chirp.CreatedAt
+	ok.UpdatedAt = chirp.UpdatedAt
+	ok.UserID = chirp.UserID.String()
+	ok.Body = chirp.Body
+
+	responseMsg(w, 201, ok)
+	//w.Header().Set("Content-Type", "application/json")
+	//w.WriteHeader(201)
+	//w.Write(resp)
+}
+
+func (cfg apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
+
+	chirps, err := cfg.Db.GetChirps(r.Context())
+	if err != nil {
+		log.Printf("Failed to retrieve chirps from database: %s", err)
+		msg := "Something went wrong"
+		responseError(w, msg, 500)
+		return
+	}
+
+	type msgOK struct {
+		ID        string `json:"id"`
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+		Body      string `json:"body"`
+		UserID    string `json:"user_id"`
+	}
+
+	msgs := make([]msgOK, len(chirps))
+
+	for i := 0; i < len(chirps); i++ {
+		msgs[i].ID = chirps[i].ID.String()
+		msgs[i].CreatedAt = chirps[i].CreatedAt.String()
+		msgs[i].UpdatedAt = chirps[i].UpdatedAt.String()
+		msgs[i].UserID = chirps[i].UserID.String()
+		msgs[i].Body = chirps[i].Body
+	}
+
+	responseMsg(w, 200, msgs)
+}
+
+func (cfg apiConfig) getChirp(w http.ResponseWriter, r *http.Request) {
+
+	chirpID := r.PathValue("chirpID")
+	uuidChirp, err := uuid.Parse(chirpID)
+	if err != nil {
+		log.Printf("Failed to parse string uuid: %s", err)
+		msg := "Something went wrong"
+		responseError(w, msg, 500)
+		return
+	}
+
+	dbChirp, err := cfg.Db.GetChirp(r.Context(), uuidChirp)
+	if err != nil {
+		log.Printf("Chirp does not exist: %s", err)
+		msg := "Chirp does not exist"
+		responseError(w, msg, 404)
+		return
+	}
+
+	type dbChirpJson struct {
+		ID        string `json:"id"`
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+		Body      string `json:"body"`
+		UserID    string `json:"user_id"`
+	}
+
+	responseMsg(w, 200, dbChirpJson{
+		ID:        dbChirp.ID.String(),
+		CreatedAt: dbChirp.CreatedAt.String(),
+		UpdatedAt: dbChirp.UpdatedAt.String(),
+		Body:      dbChirp.Body,
+		UserID:    dbChirp.UserID.String(),
+	})
+
 }
 
 func (cfg apiConfig) newUser(w http.ResponseWriter, r *http.Request) {
 
 	type client_data struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 
 	var data client_data
@@ -152,7 +256,18 @@ func (cfg apiConfig) newUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := cfg.Db.CreateUser(r.Context(), data.Email)
+	hash, err := auth.HashPassword(data.Password)
+	if err != nil {
+		log.Printf("Failed to hash password: %s", err)
+		msg := "Something went wrong"
+		responseError(w, msg, 500)
+		return
+	}
+
+	user, err := cfg.Db.CreateUser(r.Context(), database.CreateUserParams{
+		Email:          data.Email,
+		HashedPassword: hash,
+	})
 	if err != nil {
 		log.Printf("Failed to create user: %s", err)
 		msg := "Email already exists"
@@ -173,18 +288,64 @@ func (cfg apiConfig) newUser(w http.ResponseWriter, r *http.Request) {
 	json_user.Updated_at = user.UpdatedAt.String()
 	json_user.Email = user.Email
 
-	json_data, err := json.Marshal(json_user)
+	responseMsg(w, 201, json_user)
+	//w.Header().Set("Content-Type", "application/json")
+	//w.WriteHeader(201)
+	//w.Write(json_data)
+
+}
+
+func (cfg apiConfig) handleLogin(w http.ResponseWriter, r *http.Request) {
+
+	type loginInfo struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	var creds loginInfo
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&creds)
 	if err != nil {
-		log.Printf("Failed to Marshal json data: %s", err)
-		msg := "Failed to Marshal data"
+		log.Printf("Failed to decode data: %s", err)
+		msg := "Something went wrong"
 		responseError(w, msg, 500)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(201)
-	w.Write(json_data)
+	dbUser, err := cfg.Db.GetUser(r.Context(), creds.Email)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			msg := "Incorrect email or password"
+			responseError(w, msg, 401)
+			return
+		}
 
+		log.Printf("Failed to retrieve user: %s", err)
+		msg := "Something went wrong"
+		responseError(w, msg, 500)
+		return
+	}
+
+	err = auth.CheckPasswordHash(creds.Password, dbUser.HashedPassword)
+	if err != nil {
+		msg := "Incorrect email or password"
+		responseError(w, msg, 401)
+		return
+	}
+
+	type dbUserJson struct {
+		ID        string `json:"id"`
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+		Email     string `json:"email"`
+	}
+
+	responseMsg(w, 200, dbUserJson{
+		ID:        dbUser.ID.String(),
+		CreatedAt: dbUser.CreatedAt.String(),
+		UpdatedAt: dbUser.UpdatedAt.String(),
+		Email:     dbUser.Email,
+	})
 }
 
 func main() {
@@ -220,10 +381,14 @@ func main() {
 	})
 	mux.HandleFunc("GET /admin/metrics", api_cfg.requestsCount)
 	mux.HandleFunc("POST /admin/reset", api_cfg.resetCount)
-	mux.HandleFunc("POST /api/validate_chirp", func(w http.ResponseWriter, r *http.Request) {
-		parseRequest(w, r)
-	})
+
+	// API
+	mux.HandleFunc("POST /api/chirps", api_cfg.newChirp)
+	mux.HandleFunc("GET /api/chirps", api_cfg.getChirps)
 	mux.HandleFunc("POST /api/users", api_cfg.newUser)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", api_cfg.getChirp)
+	mux.HandleFunc("POST /api/login", api_cfg.handleLogin)
+	//mux.HandleFunc("POST /api/chiprs",)
 	server := http.Server{}
 	server.Handler = mux
 	server.Addr = ":8080"
