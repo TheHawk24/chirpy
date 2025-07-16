@@ -22,6 +22,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	Db             *database.Queries
 	platform       string
+	Secret         string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -88,14 +89,29 @@ func responseError(w http.ResponseWriter, msg_err string, resp_code int) {
 
 func (cfg apiConfig) newChirp(w http.ResponseWriter, r *http.Request) {
 
+	// Validate jwt
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		msg := fmt.Sprintf("%s", err)
+		responseError(w, msg, 400)
+		return
+	}
+
+	userID, err := auth.ValidateJWT(token, cfg.Secret)
+	if err != nil {
+		msg := fmt.Sprintf("%s", err)
+		responseError(w, msg, 401)
+		return
+	}
+
 	type params struct {
-		Body   string `json:"body"`
-		UserID string `json:"user_id"`
+		Body string `json:"body"`
+		//UserID string `json:"user_id"`
 	}
 
 	decoder := json.NewDecoder(r.Body)
 	var data params
-	err := decoder.Decode(&data)
+	err = decoder.Decode(&data)
 	if err != nil {
 		log.Printf("Error decoding json data: %s", err)
 		msg := "Something went wrong"
@@ -127,14 +143,15 @@ func (cfg apiConfig) newChirp(w http.ResponseWriter, r *http.Request) {
 
 	var chirp_params database.CreateChirpParams
 	chirp_params.Body = cleaned
-	user_id, err := uuid.Parse(data.UserID)
-	if err != nil {
-		log.Printf("Error parsing uuid: %s", err)
-		msg := "Something went wrong"
-		responseError(w, msg, 500)
-		return
-	}
-	chirp_params.UserID = user_id
+
+	//user_id, err := uuid.Parse(data.UserID)
+	//if err != nil {
+	//	log.Printf("Error parsing uuid: %s", err)
+	//	msg := "Something went wrong"
+	//	responseError(w, msg, 500)
+	//	return
+	//}
+	chirp_params.UserID = userID
 
 	chirp, err := cfg.Db.CreateChirp(r.Context(), chirp_params)
 	if err != nil {
@@ -298,8 +315,9 @@ func (cfg apiConfig) newUser(w http.ResponseWriter, r *http.Request) {
 func (cfg apiConfig) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	type loginInfo struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
+		Email     string `json:"email"`
+		Password  string `json:"password"`
+		ExpiresIn int    `json:"expires_in_seconds"`
 	}
 
 	var creds loginInfo
@@ -333,11 +351,25 @@ func (cfg apiConfig) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	timeDuration := time.Hour
+	if creds.ExpiresIn > 0 && creds.ExpiresIn < 3600 {
+		timeDuration = (time.Second * time.Duration(creds.ExpiresIn))
+	}
+
+	token, err := auth.MakeJWT(dbUser.ID, cfg.Secret, timeDuration)
+	if err != nil {
+		log.Printf("Failed to create jwt token")
+		msg := "Something went wrong"
+		responseError(w, msg, 500)
+		return
+	}
+
 	type dbUserJson struct {
 		ID        string `json:"id"`
 		CreatedAt string `json:"created_at"`
 		UpdatedAt string `json:"updated_at"`
 		Email     string `json:"email"`
+		Token     string `json:"token"`
 	}
 
 	responseMsg(w, 200, dbUserJson{
@@ -345,6 +377,7 @@ func (cfg apiConfig) handleLogin(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: dbUser.CreatedAt.String(),
 		UpdatedAt: dbUser.UpdatedAt.String(),
 		Email:     dbUser.Email,
+		Token:     token,
 	})
 }
 
@@ -355,6 +388,8 @@ func main() {
 
 	dbURL := os.Getenv("DB_URL")
 	pf := os.Getenv("PLATFORM")
+	secret := os.Getenv("SECRET")
+
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal("Failed to connect to database")
@@ -366,6 +401,7 @@ func main() {
 	api_cfg := apiConfig{
 		Db:       dbQueries,
 		platform: pf,
+		Secret:   secret,
 	}
 
 	//Server index.html

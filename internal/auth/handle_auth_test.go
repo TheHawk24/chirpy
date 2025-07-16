@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"encoding/base64"
+	"net/http"
 	"testing"
 	"time"
 
@@ -33,7 +35,7 @@ func TestCheckPasswordHash(t *testing.T) {
 func TestMakeJWT(t *testing.T) {
 
 	userID := uuid.New()
-	secret := "YELLOW"
+	secret := base64.StdEncoding.EncodeToString([]byte("YELLOW"))
 	time_duration := time.Minute * 2
 
 	token, err := MakeJWT(userID, secret, time_duration)
@@ -51,7 +53,8 @@ func TestMakeJWT(t *testing.T) {
 		t.Errorf("Failed test, got: %s, want: %s", jwtUUID, userID)
 	}
 
-	_, err = ValidateJWT(token, "HELLO")
+	secret = base64.StdEncoding.EncodeToString([]byte("HELLO"))
+	_, err = ValidateJWT(token, secret)
 	if err == nil {
 		t.Errorf("Failed test, supposed to error. Wrong secret")
 
@@ -64,4 +67,27 @@ func TestMakeJWT(t *testing.T) {
 		t.Errorf("Failed test, token should have expired")
 	}
 
+}
+
+func TestGetBearerToken(t *testing.T) {
+
+	headers := http.Header{
+		"Authorization": {
+			"Bear Token",
+		},
+	}
+	_, err := GetBearerToken(headers)
+	if err != nil {
+		t.Errorf("Test Failed, got: %s", err)
+	}
+
+	headers2 := http.Header{
+		"Authorization": {
+			"Bear",
+		},
+	}
+	token, err := GetBearerToken(headers2)
+	if err == nil {
+		t.Errorf("Test Failed, got: %s", token)
+	}
 }
