@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,7 @@ type apiConfig struct {
 	Db             *database.Queries
 	platform       string
 	Secret         string
+	PolkaAPIKey    string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -200,14 +202,44 @@ func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
 		UserID    string `json:"user_id"`
 	}
 
-	msgs := make([]msgOK, len(chirps))
+	authorID := uuid.Nil
+	authorIDstr := r.URL.Query().Get("author_id")
 
-	for i := 0; i < len(chirps); i++ {
-		msgs[i].ID = chirps[i].ID.String()
-		msgs[i].CreatedAt = chirps[i].CreatedAt.String()
-		msgs[i].UpdatedAt = chirps[i].UpdatedAt.String()
-		msgs[i].UserID = chirps[i].UserID.String()
-		msgs[i].Body = chirps[i].Body
+	msgs := make([]msgOK, 0)
+
+	if authorIDstr != "" {
+		authorID, err = uuid.Parse(authorIDstr)
+		if err != nil {
+			log.Printf("Failed to parse UUID: %s", err)
+			msg := "Something went wrong"
+			responseError(w, msg, http.StatusInternalServerError)
+			return
+		}
+	}
+
+	for _, dbChirp := range chirps {
+		if authorID != uuid.Nil && authorID != dbChirp.UserID {
+			continue
+		}
+
+		var msg msgOK
+		msg.ID = dbChirp.ID.String()
+		msg.CreatedAt = dbChirp.CreatedAt.String()
+		msg.UpdatedAt = dbChirp.UpdatedAt.String()
+		msg.UserID = dbChirp.UserID.String()
+		msg.Body = dbChirp.Body
+		msgs = append(msgs, msg)
+
+	}
+
+	sortMethod := r.URL.Query().Get("sort")
+	if sortMethod == "desc" {
+		sort.Slice(msgs, func(i, j int) bool {
+			layout := "2006-01-02 15:04:05.99999 -0700 -0700"
+			value1, _ := time.Parse(layout, msgs[i].CreatedAt)
+			value2, _ := time.Parse(layout, msgs[j].CreatedAt)
+			return value1.After(value2)
+		})
 	}
 
 	responseMsg(w, 200, msgs)
@@ -293,10 +325,11 @@ func (cfg *apiConfig) newUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type user_resp struct {
-		Id         string `json:"id"`
-		Created_at string `json:"created_at"`
-		Updated_at string `json:"updated_at"`
-		Email      string `json:"email"`
+		Id          string `json:"id"`
+		Created_at  string `json:"created_at"`
+		Updated_at  string `json:"updated_at"`
+		Email       string `json:"email"`
+		IsChirpyRed bool   `json:"is_chirpy_red"`
 	}
 
 	var json_user user_resp
@@ -304,6 +337,7 @@ func (cfg *apiConfig) newUser(w http.ResponseWriter, r *http.Request) {
 	json_user.Created_at = user.CreatedAt.String()
 	json_user.Updated_at = user.UpdatedAt.String()
 	json_user.Email = user.Email
+	json_user.IsChirpyRed = user.IsChirpyRed
 
 	responseMsg(w, 201, json_user)
 	//w.Header().Set("Content-Type", "application/json")
@@ -389,6 +423,7 @@ func (cfg *apiConfig) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Email        string `json:"email"`
 		Token        string `json:"token"`
 		RefreshToken string `json:"refresh_token"`
+		IsChirpyRed  bool   `json:"is_chirpy_red"`
 	}
 
 	responseMsg(w, 200, dbUserJson{
@@ -398,6 +433,7 @@ func (cfg *apiConfig) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Email:        dbUser.Email,
 		Token:        token,
 		RefreshToken: dbRefreshToken.Token,
+		IsChirpyRed:  dbUser.IsChirpyRed,
 	})
 }
 
@@ -538,17 +574,19 @@ func (cfg *apiConfig) updateUserInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type dbUserJson struct {
-		ID        string `json:"id"`
-		Email     string `json:"email"`
-		CreatedAt string `json:"created_at"`
-		UpdatedAt string `json:"updated_at"`
+		ID          string `json:"id"`
+		Email       string `json:"email"`
+		CreatedAt   string `json:"created_at"`
+		UpdatedAt   string `json:"updated_at"`
+		IsChirpyRed bool   `json:"is_chirpy_red"`
 	}
 
 	responseMsg(w, http.StatusOK, dbUserJson{
-		ID:        dbUser.ID.String(),
-		Email:     dbUser.Email,
-		CreatedAt: dbUser.CreatedAt.String(),
-		UpdatedAt: dbUser.UpdatedAt.String(),
+		ID:          dbUser.ID.String(),
+		Email:       dbUser.Email,
+		CreatedAt:   dbUser.CreatedAt.String(),
+		UpdatedAt:   dbUser.UpdatedAt.String(),
+		IsChirpyRed: dbUser.IsChirpyRed,
 	})
 }
 
@@ -614,6 +652,62 @@ func (cfg *apiConfig) deleteChirp(w http.ResponseWriter, r *http.Request) {
 	responseMsg(w, http.StatusNoContent, nil)
 }
 
+func (cfg *apiConfig) upgradeUser(w http.ResponseWriter, r *http.Request) {
+
+	apiKey, err := auth.GetAPIKey(r.Header)
+	if err != nil {
+		responseMsg(w, http.StatusUnauthorized, nil)
+		return
+	}
+
+	if cfg.PolkaAPIKey != apiKey {
+		responseMsg(w, http.StatusUnauthorized, nil)
+		return
+	}
+
+	type webhook struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserID string `json:"user_id"`
+		} `json:"data"`
+	}
+
+	var payment webhook
+	decoder := json.NewDecoder(r.Body)
+	err = decoder.Decode(&payment)
+	if err != nil {
+		log.Printf("Failed to decode data from webhook: %s", err)
+		responseMsg(w, http.StatusInternalServerError, nil)
+		return
+	}
+
+	if payment.Event != "user.upgraded" {
+		responseMsg(w, http.StatusNoContent, nil)
+		return
+	}
+
+	if payment.Event == "user.upgraded" {
+		parseUUID, err := uuid.Parse(payment.Data.UserID)
+		if err != nil {
+			log.Printf("Failed to parse UUID: %s", err)
+			responseMsg(w, http.StatusInternalServerError, nil)
+			return
+		}
+		_, err = cfg.Db.UpgradeUserChirpyRed(r.Context(), parseUUID)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				log.Printf("Could not find user with ID: %s", err)
+				responseMsg(w, http.StatusNotFound, nil)
+				return
+			}
+		}
+
+		responseMsg(w, http.StatusNoContent, nil)
+		return
+	}
+
+}
+
 func main() {
 
 	//Database connection
@@ -624,6 +718,7 @@ func main() {
 	dbURL := os.Getenv("DB_URL")
 	pf := os.Getenv("PLATFORM")
 	secret := os.Getenv("SECRET")
+	polkaAPIKEY := os.Getenv("POLKA_API_KEY")
 
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
@@ -634,9 +729,10 @@ func main() {
 
 	mux := http.NewServeMux()
 	api_cfg := apiConfig{
-		Db:       dbQueries,
-		platform: pf,
-		Secret:   secret,
+		Db:          dbQueries,
+		platform:    pf,
+		Secret:      secret,
+		PolkaAPIKey: polkaAPIKEY,
 	}
 
 	//Server index.html
@@ -663,6 +759,9 @@ func main() {
 	mux.HandleFunc("POST /api/login", api_cfg.handleLogin)
 	mux.HandleFunc("POST /api/refresh", api_cfg.handleRefreshToken)
 	mux.HandleFunc("POST /api/revoke", api_cfg.handleRevokeRefreshToken)
+
+	// API webhook
+	mux.HandleFunc("POST /api/polka/webhooks", api_cfg.upgradeUser)
 
 	//mux.HandleFunc("POST /api/chiprs",)
 	server := http.Server{}
