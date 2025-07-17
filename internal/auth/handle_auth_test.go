@@ -73,7 +73,7 @@ func TestGetBearerToken(t *testing.T) {
 
 	headers := http.Header{
 		"Authorization": {
-			"Bear Token",
+			"Bearer Token",
 		},
 	}
 	_, err := GetBearerToken(headers)
@@ -83,11 +83,19 @@ func TestGetBearerToken(t *testing.T) {
 
 	headers2 := http.Header{
 		"Authorization": {
-			"Bear",
+			"Bearer",
 		},
 	}
 	token, err := GetBearerToken(headers2)
 	if err == nil {
 		t.Errorf("Test Failed, got: %s", token)
+	}
+}
+
+func TestMakeRefreshToken(t *testing.T) {
+
+	_, err := MakeRefreshToken()
+	if err != nil {
+		t.Errorf("Test Failed, got: %s", err)
 	}
 }
